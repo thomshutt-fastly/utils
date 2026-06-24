@@ -1,0 +1,35 @@
+#!/usr/bin/env zsh
+
+# Check if an argument was provided
+if [ -z "$1" ]; then
+  echo "Usage: $0 <epoch_timestamp>"
+  echo "Example: $0 1719220000"
+  exit 1
+fi
+
+input=$1
+
+# Validate that the input is a number
+if [[ ! "$input" =~ ^[0-9]+$ ]]; then
+  echo "Error: Timestamp must be a positive integer."
+  exit 1
+fi
+
+# Determine if the timestamp is in seconds or milliseconds.
+# Standard epoch in seconds is typically 10 digits (until the year 2286).
+# If it's longer than 10 digits, we assume it's in milliseconds.
+if [ ${#input} -gt 10 ]; then
+  # Convert milliseconds to seconds
+  seconds=$((input / 1000))
+  echo "Detected milliseconds. Converting..."
+else
+  seconds=$input
+fi
+
+# Use macOS (BSD) date command to convert.
+# -u : Output in UTC
+# -r : Read the time in seconds since the epoch
+formatted_date=$(date -u -r "$seconds" "+%Y-%m-%d %H:%M:%S UTC")
+
+echo "Epoch: $input"
+echo "Date:  $formatted_date"
