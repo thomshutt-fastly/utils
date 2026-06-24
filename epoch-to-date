@@ -3,7 +3,8 @@
 # Check if an argument was provided
 if [ -z "$1" ]; then
   echo "Usage: $0 <epoch_timestamp>"
-  echo "Example: $0 1719220000"
+  echo "Example: $0 1781708567000"
+  echo "Example: $0 1781708567"
   exit 1
 fi
 
@@ -21,7 +22,6 @@ fi
 if [ ${#input} -gt 10 ]; then
   # Convert milliseconds to seconds
   seconds=$((input / 1000))
-  echo "Detected milliseconds. Converting..."
 else
   seconds=$input
 fi
@@ -31,5 +31,4 @@ fi
 # -r : Read the time in seconds since the epoch
 formatted_date=$(date -u -r "$seconds" "+%Y-%m-%d %H:%M:%S UTC")
 
-echo "Epoch: $input"
 echo "Date:  $formatted_date"
