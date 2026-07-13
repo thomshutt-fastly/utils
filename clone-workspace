@@ -1,0 +1,25 @@
+#!/bin/zsh
+
+# Check if a URL was provided
+if [ -z "$1" ]; then
+    echo "Error: Please provide a GitHub URL."
+    echo "Usage: $0 <github-url>"
+    exit 1
+fi
+
+URL=$1
+BASE_DIR="$HOME/Workspace/github.com"
+
+# Extract the user/repo part from the URL
+# This removes the 'https://github.com/' prefix and any trailing '.git'
+REPO_PATH="${URL#*github.com/}"
+REPO_PATH="${REPO_PATH%.git}"
+
+# Define the target directory
+TARGET_DIR="$BASE_DIR/$REPO_PATH"
+
+# Create the user directory if it doesn't exist
+mkdir -p "$(dirname "$TARGET_DIR")"
+
+# Clone the repository
+git clone "$URL" "$TARGET_DIR"
