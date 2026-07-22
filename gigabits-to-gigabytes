@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Check if an argument was provided
+if [ -z "$1" ]; then
+    echo "Usage: $0 <speed_in_gbps>"
+    echo "Example: $0 1.5"
+    exit 1
+fi
+
+GBPS=$1
+
+# Calculations (Using 'bc' for floating-point arithmetic)
+# 1 Gigabit = 0.125 Gigabytes
+# Seconds in a day = 86,400 (60 * 60 * 24)
+GB_PER_DAY=$(echo "scale=2; $GBPS * 0.125 * 86400" | bc)
+TB_PER_DAY=$(echo "scale=2; $GB_PER_DAY / 1000" | bc)
+
+echo "--- Conversion Results ---"
+echo "Speed:            $GBPS Gbps"
+echo "Daily Transfer:   $GB_PER_DAY GB / day"
+echo "Daily Transfer:   $TB_PER_DAY TB / day"
