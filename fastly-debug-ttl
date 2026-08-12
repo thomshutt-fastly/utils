@@ -1,0 +1,237 @@
+#!/usr/bin/env zsh
+
+# Decode a Fastly-Debug-TTL response header into something human readable.
+#
+# Fastly returns this header when the request carries "Fastly-Debug: 1". The
+# value is one or more parenthesised groups, one per cache node that touched the
+# request:
+#
+#   (<state> <server.identity> <remaining-ttl> <stale-if-error> <age>)
+#
+# state is H (hit) or M (miss). The remaining TTL can be negative, which means
+# the object has expired and is being served stale. Any of the three numeric
+# fields can be the literal "-", which means this node is not the one holding
+# the object in its own local cache (clustering / shielding).
+#
+# Note that the second number is the stale-if-error window, not
+# stale-while-revalidate, so it is not a reliable way to check the latter.
+
+# Insulate the script from options a user's ~/.zshenv might have set. KSH_ARRAYS
+# in particular would break the $fields[1] and ${parts[1,2]} subscripts below.
+emulate -L zsh
+
+# Force a C decimal point so printf and bc always agree on "." as the separator.
+LC_NUMERIC=C
+
+# Check if an argument was provided
+if [ -z "$1" ]; then
+  # With no arguments, fall back to standard input so the script can be piped
+  # to. If stdin is a terminal there is nothing to read, so show usage instead.
+  if [ -t 0 ]; then
+    echo "Usage: $0 '<fastly-debug-ttl-header-value>'"
+    echo "Example: $0 '(H cache-lcy-egml8630034-LCY 37.253 604800.000 83)'"
+    echo "Example: curl -sI -H 'Fastly-Debug: 1' https://www.example.com | grep -i fastly-debug-ttl | $0"
+    echo ""
+    echo "Note: the header value must be quoted. zsh reads a bare (H ...) as a"
+    echo "glob qualifier and fails before this script ever runs."
+    exit 1
+  fi
+  raw=$(cat)
+else
+  # Join all arguments with a space so a header pasted as several words works.
+  raw="$*"
+fi
+
+# True when the field is a plain decimal number, and therefore safe to hand to
+# printf and bc. The pattern must be quoted: left unquoted, zsh strips the
+# backslash from "\." and the bare dot then matches any character, so a value
+# like 1e5 would sneak through and confuse bc.
+is_number() {
+  [[ "$1" =~ '^-?[0-9]+(\.[0-9]+)?$' ]]
+}
+
+# Turn a possibly negative, possibly fractional number of seconds into a compact
+# human string built from the two largest non-zero units, for example
+#   604800.000   -> 7 days
+#   15085173.368 -> 174 days 14 hours
+#   83           -> 1 minute 23 seconds
+#   -10.999      -> 11 seconds
+# The sign is dropped; callers supply the "for another ..." / "... ago" wording.
+humanise() {
+  # printf is a zsh builtin and rounds to nearest, so -10.999 becomes -11 rather
+  # than truncating to -10 the way %d would. Everything after this is exact
+  # integer arithmetic, so bc is not needed here.
+  local total
+  printf -v total "%.0f" "$1"
+  total=${total#-}
+
+  if [ "$total" -eq 0 ]; then
+    echo "0 seconds"
+    return
+  fi
+
+  local -a parts
+  local pair count unit
+  for pair in "$((total / 86400)) day" \
+              "$(((total % 86400) / 3600)) hour" \
+              "$(((total % 3600) / 60)) minute" \
+              "$((total % 60)) second"; do
+    count=${pair% *}
+    unit=${pair#* }
+    if [ "$count" -gt 0 ]; then
+      if [ "$count" -eq 1 ]; then
+        parts+=("$count $unit")
+      else
+        parts+=("$count ${unit}s")
+      fi
+    fi
+  done
+
+  # Keep at most the two largest units.
+  echo ${parts[1,2]}
+}
+
+# Flatten every kind of whitespace to a plain space first. Long header values
+# get folded across lines with leading indentation, and each group has to be on
+# one line before ")" can be used as the group separator.
+raw="${raw//[[:space:]]/ }"
+
+# Drop everything before the first "(". That discards an optional
+# "Fastly-Debug-TTL:" name whatever its case, and curl -v's leading "< " too. If
+# there is no "(" at all the value is left alone, so a bare group still parses.
+raw="${raw#*\(}"
+
+# Delete the remaining "(" and turn every ")" into a newline, giving one group
+# per line. The replacement has to come from a variable: $'\n' written inline
+# inside ${var//.../...} is inserted as literal characters, not as a newline.
+newline=$'\n'
+raw="${raw//\(/}"
+raw="${raw//\)/$newline}"
+
+# ${(f)...} splits on newlines. Unquoted, it also drops the empty element left
+# behind by the final ")".
+groups=(${(f)raw})
+
+if [ ${#groups} -eq 0 ]; then
+  echo "Error: No cache node groups found in the input."
+  exit 1
+fi
+
+now_epoch=$(date -u +%s)
+node_number=1
+
+for group in $groups; do
+  # ${=group} force-splits on whitespace whatever SH_WORD_SPLIT is set to,
+  # collapsing runs of spaces and dropping empty fields.
+  fields=(${=group})
+
+  # Trailing whitespace after the last ")" leaves a blank group behind, so skip
+  # anything with no fields rather than warning about it.
+  if [ ${#fields} -eq 0 ]; then
+    continue
+  fi
+
+  echo "--- Node $node_number ---"
+  node_number=$((node_number + 1))
+
+  if [ ${#fields} -ne 5 ]; then
+    echo "Warning:         expected 5 fields, found ${#fields}: $group"
+    echo ""
+    continue
+  fi
+
+  state=$fields[1]
+  node=$fields[2]
+  ttl=$fields[3]
+  stale=$fields[4]
+  age=$fields[5]
+
+  # The POP code is the trailing segment of the node name, for example
+  # cache-lcy-egml8630034-LCY -> LCY
+  pop=${node##*-}
+  if [ "$pop" = "$node" ]; then
+    pop="unknown"
+  fi
+
+  case $state in
+    H|h) result="HIT" ;;
+    M|m) result="MISS" ;;
+    *)   result="UNKNOWN ($state)" ;;
+  esac
+
+  if [ "$ttl" = "-" ]; then
+    ttl_text="not reported (object is not in this node's own cache)"
+    expiry_text="n/a"
+    expired="unknown"
+  elif ! is_number "$ttl"; then
+    ttl_text="$ttl (unrecognised value)"
+    expiry_text="n/a"
+    expired="unparsable"
+  else
+    ttl_human=$(humanise "$ttl")
+    ttl_text="$ttl seconds ($ttl_human)"
+
+    # bc gives a real float comparison, so -0.400 counts as expired even though
+    # it rounds to zero whole seconds.
+    if [ "$(bc <<< "$ttl < 0")" -eq 1 ]; then
+      expired="yes"
+    else
+      expired="no"
+    fi
+
+    # Round the TTL to whole seconds, add it to now, and format the result.
+    # Doing the arithmetic here and feeding date -u -r avoids date -v, which
+    # refuses any adjustment larger than INT_MAX seconds.
+    printf -v ttl_seconds "%.0f" "$ttl"
+    expiry_text=$(date -u -r $((now_epoch + ttl_seconds)) "+%Y-%m-%d %H:%M:%S UTC")
+    if [ "$expired" = "yes" ]; then
+      expiry_text="$expiry_text (in the past)"
+    fi
+  fi
+
+  if [ "$stale" = "-" ]; then
+    stale_text="not reported"
+  elif ! is_number "$stale"; then
+    stale_text="$stale (unrecognised value)"
+  elif [ "$(bc <<< "$stale > 0")" -eq 1 ]; then
+    stale_text="$stale seconds ($(humanise "$stale"))"
+  else
+    stale_text="none configured"
+  fi
+
+  if [ "$age" = "-" ]; then
+    age_text="not reported"
+  elif ! is_number "$age"; then
+    age_text="$age (unrecognised value)"
+  else
+    age_text="$age seconds ($(humanise "$age"))"
+  fi
+
+  if [ "$expired" = "unparsable" ]; then
+    verdict="$result — could not read the remaining TTL"
+  elif [ "$expired" = "unknown" ]; then
+    if [ "$result" = "MISS" ]; then
+      verdict="MISS — not in this node's cache"
+    else
+      verdict="$result — served by this POP, but from another node's cache"
+    fi
+  elif [ "$expired" = "yes" ]; then
+    if [ "$ttl_human" = "0 seconds" ]; then
+      verdict="$result — expired just now, served stale"
+    else
+      verdict="$result — expired $ttl_human ago, served stale"
+    fi
+  else
+    verdict="$result — fresh for another $ttl_human"
+  fi
+
+  echo "Node:            $node"
+  echo "POP:             $pop"
+  echo "Result:          $result"
+  echo "Remaining TTL:   $ttl_text"
+  echo "Expires:         $expiry_text"
+  echo "Stale-if-error:  $stale_text"
+  echo "Age:             $age_text"
+  echo "Verdict:         $verdict"
+  echo ""
+done
