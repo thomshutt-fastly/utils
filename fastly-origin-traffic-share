@@ -1,0 +1,829 @@
+#!/usr/bin/env python3
+
+"""Pull Origin Inspector stats for a Fastly service and chart each origin's
+% share of total traffic per day, as a self-contained HTML page with two
+line charts: one by request count, one by response bytes. The two can
+disagree a lot (an origin serving few-but-large responses vs. one serving
+many small ones), which is exactly why both are shown rather than picking
+one as "traffic". Above those, a third chart shows absolute total egress
+(response bytes summed across all origins) per day, since shares alone hide
+whether overall volume grew or shrank.
+
+The window defaults to the last 30 days including today: today's bucket is
+still accumulating, so its line segment is drawn dotted and its endpoint a
+hollow ring, and a caption notes it'll keep changing until the day closes.
+
+Origin Inspector is a paid add-on enabled per service. If it is not enabled,
+the API still answers 200 with an empty data array -- indistinguishable from
+"no traffic" -- so an empty result prints a hint to check
+`fastly products -s <service-id>` rather than silently drawing a blank chart.
+"""
+
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+API_HOST = "https://api.fastly.com"
+
+REQUEST_METRICS = ["all_status_1xx", "all_status_2xx", "all_status_3xx", "all_status_4xx", "all_status_5xx"]
+BYTES_METRICS = ["all_resp_body_bytes", "all_resp_header_bytes"]
+
+# Categorical palette (fixed order, so each slot keeps a stable color).
+# "Other" (the folded remainder beyond --top origins) uses the muted ink
+# color instead of a categorical slot, since it isn't a real identity.
+SERIES_COLORS_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+SERIES_COLORS_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"]
+OTHER_COLOR_LIGHT = "#898781"
+OTHER_COLOR_DARK = "#898781"
+
+# Keys that might hold a bucket's timestamp in an Origin Inspector response
+# row. Confirmed by inspecting a live response to be "timestamp" (epoch
+# seconds), but the other candidates are kept as a fallback in case it
+# varies by account/API version.
+TIME_KEYS = ("timestamp", "start", "time", "bucket", "ts")
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def get_token(explicit):
+    if explicit:
+        return explicit
+    env_token = os.environ.get("FASTLY_API_TOKEN")
+    if env_token:
+        return env_token
+    try:
+        result = subprocess.run(
+            ["fastly", "auth", "token", "--quiet"],
+            capture_output=True, text=True, check=True,
+        )
+        token = result.stdout.strip()
+        if token:
+            return token
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    sys.exit(
+        "Error: no Fastly API token found. Set FASTLY_API_TOKEN, pass --token, "
+        "or run `fastly auth login` (this script shells out to `fastly auth token --quiet`)."
+    )
+
+
+def fetch_origin_metrics(service_id, token, start, end):
+    """Fetch request-count and byte metrics for every origin in one paginated
+    API sweep (they're independent metric names on the same rows, so one
+    request per page covers both)."""
+    metrics = REQUEST_METRICS + BYTES_METRICS
+    requests_by_host_date = {}
+    bytes_by_host_date = {}
+    cursor = ""
+    while True:
+        params = {
+            "start": start,
+            "end": end,
+            "downsample": "day",
+            "metric": ",".join(metrics),
+            "group_by": "host",
+            "limit": "200",
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        url = f"{API_HOST}/metrics/origins/services/{urllib.parse.quote(service_id)}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"Fastly-Key": token, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req) as resp:
+                payload = json.load(resp)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
+            sys.exit(f"Error: Fastly API returned {e.code} {e.reason}: {body}")
+
+        if payload.get("status") != "success":
+            sys.exit(f"Error: Fastly API returned an error: {payload.get('msg', payload)}")
+
+        for entry in payload.get("data", []):
+            dims = entry.get("dimensions") or {}
+            host = dims.get("host") or "unknown"
+            for row in entry.get("values", []):
+                date = _bucket_date(row)
+                req_total = _sum_metrics(row, REQUEST_METRICS)
+                byte_total = _sum_metrics(row, BYTES_METRICS)
+                requests_by_host_date.setdefault(host, {})
+                requests_by_host_date[host][date] = requests_by_host_date[host].get(date, 0) + req_total
+                bytes_by_host_date.setdefault(host, {})
+                bytes_by_host_date[host][date] = bytes_by_host_date[host].get(date, 0) + byte_total
+
+        cursor = (payload.get("meta") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+
+    return requests_by_host_date, bytes_by_host_date
+
+
+def _bucket_date(row):
+    for key in TIME_KEYS:
+        if key in row:
+            return _normalize_date(row[key])
+    raise SystemExit(
+        "Error: couldn't find a timestamp field in an Origin Inspector response row "
+        f"(tried {TIME_KEYS}): {row!r}\n"
+        "The response shape may not match what this script expects -- please report this."
+    )
+
+
+def _normalize_date(value):
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).date().isoformat()
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text).date().isoformat()
+
+
+def _sum_metrics(row, metric_names):
+    total = 0.0
+    for name in metric_names:
+        value = row.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += value
+    return total
+
+
+def daterange(start_date, end_date):
+    days = []
+    d = start_date
+    while d < end_date:
+        days.append(d.isoformat())
+        d += timedelta(days=1)
+    return days
+
+
+def rank_hosts_by_volume(by_host_date_list, top):
+    """Rank the union of hosts seen across one or more metric dicts by their
+    combined volume in the (canonically first) dict, so both charts fold the
+    same hosts into 'Other' and keep origin identity/color consistent."""
+    primary = by_host_date_list[0]
+    all_hosts = set()
+    for d in by_host_date_list:
+        all_hosts |= set(d.keys())
+    ranked = sorted(all_hosts, key=lambda h: sum(primary.get(h, {}).values()), reverse=True)
+    return ranked[: top - 1] if len(ranked) > top else ranked
+
+
+def build_series(by_host_date, dates, kept_hosts):
+    all_hosts = set(by_host_date.keys())
+    overflow = [h for h in all_hosts if h not in kept_hosts]
+
+    totals_per_date = {d: 0.0 for d in dates}
+    host_values = {}
+    for host in kept_hosts:
+        values = [by_host_date.get(host, {}).get(d, 0.0) for d in dates]
+        host_values[host] = values
+        for d, v in zip(dates, values):
+            totals_per_date[d] += v
+
+    if overflow:
+        other_values = []
+        for d in dates:
+            v = sum(by_host_date.get(h, {}).get(d, 0.0) for h in overflow)
+            other_values.append(v)
+            totals_per_date[d] += v
+        host_values["Other"] = other_values
+
+    series = []
+    for host, values in host_values.items():
+        shares = []
+        for d, v in zip(dates, values):
+            total = totals_per_date[d]
+            shares.append((v / total * 100.0) if total > 0 else 0.0)
+        series.append({"host": host, "shares": shares})
+
+    # Stable, deterministic order: by total share descending, "Other" last.
+    series.sort(key=lambda s: (s["host"] == "Other", -sum(s["shares"])))
+    return series
+
+
+def trend_line_svg(values, x_at, y_at, partial_today, stroke_style, clip_id):
+    """Dashed least-squares linear trend across the whole window. Today's
+    partial bucket is excluded from the fit (it would drag the slope down)
+    but the line is still extended to it. Clipped to the plot area so a
+    steep trend can't escape the axes."""
+    fit_values = values[:-1] if partial_today and len(values) > 2 else values
+    m = len(fit_values)
+    if m < 2:
+        return ""
+    mean_x = (m - 1) / 2
+    mean_y = sum(fit_values) / m
+    var_x = sum((i - mean_x) ** 2 for i in range(m))
+    slope = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(fit_values)) / var_x
+    intercept = mean_y - slope * mean_x
+    last = len(values) - 1
+    return (
+        f'<line class="trend-line" x1="{x_at(0):.1f}" y1="{y_at(intercept):.1f}" '
+        f'x2="{x_at(last):.1f}" y2="{y_at(intercept + slope * last):.1f}" '
+        f'stroke-width="1.5" stroke-dasharray="6 4" clip-path="url(#{clip_id})" style="{stroke_style}" />'
+    )
+
+
+def plot_clip_svg(clip_id, x, y, w, h):
+    return f'<defs><clipPath id="{clip_id}"><rect x="{x}" y="{y}" width="{w}" height="{h}" /></clipPath></defs>'
+
+
+TREND_NOTE = "Dashed lines are linear trends"
+
+
+def render_section(section_id, title, metric_label, dates, series, host_colors, partial_today):
+    width, height = 960, 440
+    margin_left, margin_right, margin_top, margin_bottom = 50, 40, 20, 40
+    chart_w = width - margin_left - margin_right
+    chart_h = height - margin_top - margin_bottom
+    n = len(dates)
+
+    def x_at(i):
+        if n <= 1:
+            return margin_left
+        return margin_left + i * (chart_w / (n - 1))
+
+    def y_at(share):
+        return margin_top + chart_h - (share / 100.0) * chart_h
+
+    def color_for(host, dark):
+        if host == "Other" or host not in host_colors:
+            return OTHER_COLOR_DARK if dark else OTHER_COLOR_LIGHT
+        palette = SERIES_COLORS_DARK if dark else SERIES_COLORS_LIGHT
+        return palette[host_colors[host] % len(palette)]
+
+    def css_idx(host):
+        return host_colors.get(host, "other")
+
+    # Gridlines at 0/25/50/75/100%.
+    gridlines = "".join(
+        f'<line class="grid" x1="{margin_left}" y1="{y_at(pct):.1f}" '
+        f'x2="{width - margin_right}" y2="{y_at(pct):.1f}" />'
+        f'<text class="axis-label" x="{margin_left - 8}" y="{y_at(pct) + 4:.1f}" text-anchor="end">{pct}%</text>'
+        for pct in (0, 25, 50, 75, 100)
+    )
+
+    # X-axis labels: cap at ~8 to avoid clutter. Always include the last date,
+    # but merge it into the preceding tick rather than adding a second one
+    # when they'd land close enough to overlap.
+    label_stride = max(1, round(n / 8)) if n else 1
+    label_indices = list(range(0, n, label_stride))
+    if n:
+        if label_indices[-1] != n - 1:
+            if n - 1 - label_indices[-1] < label_stride / 2:
+                label_indices[-1] = n - 1
+            else:
+                label_indices.append(n - 1)
+    x_labels = "".join(
+        f'<text class="axis-label" x="{x_at(i):.1f}" y="{height - margin_bottom + 16}" text-anchor="middle">'
+        f'{dates[i]}{"*" if partial_today and i == n - 1 else ""}</text>'
+        for i in label_indices
+    )
+
+    # Endpoint labels show only the percentage (never the hostname): hostnames
+    # are unbounded-length origin domains that would overflow the page, and
+    # this is a static file with no way to measure rendered text width ahead
+    # of time. Identity comes from the legend + hover tooltip instead.
+    lines_svg = []
+    trends_svg = []
+    dots_svg = []
+    endpoint_labels = []
+    endpoints = []
+    for s in series:
+        host = s["host"]
+        light = color_for(host, dark=False)
+        var = f"--series-{section_id}-{css_idx(host)}"
+        pts = [(x_at(i), y_at(v)) for i, v in enumerate(s["shares"])]
+
+        # The last (today) bucket is still accumulating, so its segment is
+        # drawn dotted rather than solid, to flag it as provisional.
+        if partial_today and n >= 2:
+            solid_pts, dotted_pts = pts[:-1], pts[-2:]
+        else:
+            solid_pts, dotted_pts = pts, []
+
+        solid_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in solid_pts)
+        lines_svg.append(
+            f'<polyline class="series-line" points="{solid_str}" fill="none" stroke-width="2" '
+            f'style="stroke:var({var}, {light})" />'
+        )
+        if dotted_pts:
+            dotted_str = " ".join(f"{x:.1f},{y:.1f}" for x, y in dotted_pts)
+            lines_svg.append(
+                f'<polyline class="series-line" points="{dotted_str}" fill="none" stroke-width="2" '
+                f'stroke-linecap="round" stroke-dasharray="0.1 6" '
+                f'style="stroke:var({var}, {light})" />'
+            )
+        trends_svg.append(
+            trend_line_svg(s["shares"], x_at, y_at, partial_today, f"stroke:var({var}, {light})", f"clip-{section_id}")
+        )
+
+        if n:
+            last_x, last_y = x_at(n - 1), y_at(s["shares"][-1])
+            if partial_today:
+                # Hollow ring instead of a filled dot: not-yet-final data point.
+                dots_svg.append(
+                    f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4" fill="var(--surface-1)" '
+                    f'stroke-width="2" class="series-dot" style="stroke:var({var}, {light})" />'
+                )
+            else:
+                dots_svg.append(
+                    f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4" '
+                    f'class="series-dot" style="fill:var({var}, {light})" />'
+                )
+            endpoints.append([last_y, s["shares"][-1]])
+
+    if endpoints:
+        # De-collide endpoint labels: sort by y, push apart if closer than 12px.
+        endpoints.sort(key=lambda e: e[0])
+        min_gap = 12
+        for i in range(1, len(endpoints)):
+            if endpoints[i][0] - endpoints[i - 1][0] < min_gap:
+                endpoints[i][0] = endpoints[i - 1][0] + min_gap
+        for y, share in endpoints:
+            endpoint_labels.append(
+                f'<text class="endpoint-label" x="{x_at(n - 1) + 8:.1f}" y="{y + 4:.1f}">{share:.0f}%</text>'
+            )
+
+    legend_items = "".join(
+        f'<span class="legend-item"><span class="swatch" '
+        f'style="background:var(--series-{section_id}-{css_idx(s["host"])}, {color_for(s["host"], dark=False)})">'
+        f'</span>{s["host"]}</span>'
+        for s in series
+    )
+
+    table_rows = "".join(
+        "<tr><td>{date}</td>{cells}</tr>".format(
+            date=d,
+            cells="".join(f"<td>{s['shares'][i]:.1f}%</td>" for s in series),
+        )
+        for i, d in enumerate(dates)
+    )
+    table_header = "".join(f"<th>{s['host']}</th>" for s in series)
+
+    chart_data = json.dumps(
+        {
+            "dates": dates,
+            "series": [{"host": s["host"], "shares": s["shares"]} for s in series],
+            "geometry": {"width": width, "height": height},
+            "xAt": [x_at(i) for i in range(n)],
+        }
+    )
+
+    css_vars_light = "\n".join(
+        f"  --series-{section_id}-{css_idx(s['host'])}: {color_for(s['host'], dark=False)};" for s in series
+    )
+    css_vars_dark = "\n".join(
+        f"  --series-{section_id}-{css_idx(s['host'])}: {color_for(s['host'], dark=True)};" for s in series
+    )
+
+    svg_html = f"""
+  <svg viewBox="0 0 {width} {height}">
+    {plot_clip_svg(f"clip-{section_id}", margin_left, margin_top, chart_w, chart_h)}
+    {gridlines}
+    <line x1="{margin_left}" y1="{margin_top + chart_h}" x2="{width - margin_right}" y2="{margin_top + chart_h}" stroke="var(--baseline)" stroke-width="1" />
+    {"".join(trends_svg)}
+    {"".join(lines_svg)}
+    {"".join(dots_svg)}
+    {x_labels}
+    {"".join(endpoint_labels)}
+    <rect id="hover-target-{section_id}" x="{margin_left}" y="{margin_top}" width="{chart_w}" height="{chart_h}" fill="transparent" />
+    <line id="crosshair-{section_id}" x1="0" y1="{margin_top}" x2="0" y2="{margin_top + chart_h}" stroke="var(--baseline)" stroke-width="1" style="display:none" />
+  </svg>
+"""
+
+    partial_note = (
+        f'<p class="note">* {dates[-1]} is today (UTC) and still accumulating -- '
+        f'the dotted segment will keep changing until the day closes. '
+        f'{TREND_NOTE} (least-squares fit, excluding today).</p>'
+        if partial_today and dates else f'<p class="note">{TREND_NOTE} (least-squares fit).</p>'
+    )
+
+    section_html = f"""
+<h2>{title}</h2>
+<p class="subtitle">% share of total {metric_label} per day, {dates[0] if dates else "?"} to {dates[-1] if dates else "?"}</p>
+<div class="chart-card" style="position: relative;">
+  {svg_html}
+  <div id="tooltip-{section_id}" class="tooltip"></div>
+  <div class="legend">{legend_items}</div>
+</div>
+{partial_note}
+<details class="table-view">
+  <summary>View as table</summary>
+  <table>
+    <thead><tr><th>Date</th>{table_header}</tr></thead>
+    <tbody>{table_rows}</tbody>
+  </table>
+</details>
+"""
+
+    js_snippet = f"""
+wireHover({json.dumps(section_id)}, {chart_data});
+"""
+
+    return section_html, css_vars_light, css_vars_dark, js_snippet
+
+
+BYTE_UNITS = [("PB", 1e15), ("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3), ("B", 1)]
+
+
+def format_bytes(value):
+    for unit, size in BYTE_UNITS:
+        if abs(value) >= size:
+            return f"{value / size:.1f} {unit}"
+    return "0 B"
+
+
+def nice_ticks(max_value, count=4):
+    """Round-numbered y-axis ticks (1/2/5 x 10^k steps) from 0 to >= max_value."""
+    if max_value <= 0:
+        return [0, 1]
+    raw_step = max_value / count
+    magnitude = 10 ** math.floor(math.log10(raw_step))
+    step = next(m * magnitude for m in (1, 2, 5, 10) if m * magnitude >= raw_step)
+    top = math.ceil(max_value / step) * step
+    return [i * step for i in range(int(round(top / step)) + 1)]
+
+
+def render_total_section(section_id, dates, totals, partial_today):
+    """Absolute total egress (response bytes summed across all origins) per
+    day, as a single-series line chart. Shares hide whether the pie itself
+    grew or shrank; this shows the size of the pie."""
+    width, height = 960, 300
+    margin_left, margin_right, margin_top, margin_bottom = 70, 40, 20, 40
+    chart_w = width - margin_left - margin_right
+    chart_h = height - margin_top - margin_bottom
+    n = len(dates)
+    ticks = nice_ticks(max(totals) if totals else 0)
+    y_max = ticks[-1]
+    light, dark = SERIES_COLORS_LIGHT[0], SERIES_COLORS_DARK[0]
+    var = f"--series-{section_id}-total"
+
+    def x_at(i):
+        if n <= 1:
+            return margin_left
+        return margin_left + i * (chart_w / (n - 1))
+
+    def y_at(value):
+        return margin_top + chart_h - (value / y_max) * chart_h
+
+    gridlines = "".join(
+        f'<line class="grid" x1="{margin_left}" y1="{y_at(t):.1f}" '
+        f'x2="{width - margin_right}" y2="{y_at(t):.1f}" />'
+        f'<text class="axis-label" x="{margin_left - 8}" y="{y_at(t) + 4:.1f}" text-anchor="end">{format_bytes(t)}</text>'
+        for t in ticks
+    )
+
+    label_stride = max(1, round(n / 8)) if n else 1
+    label_indices = list(range(0, n, label_stride))
+    if n and label_indices[-1] != n - 1:
+        if n - 1 - label_indices[-1] < label_stride / 2:
+            label_indices[-1] = n - 1
+        else:
+            label_indices.append(n - 1)
+    x_labels = "".join(
+        f'<text class="axis-label" x="{x_at(i):.1f}" y="{height - margin_bottom + 16}" text-anchor="middle">'
+        f'{dates[i]}{"*" if partial_today and i == n - 1 else ""}</text>'
+        for i in label_indices
+    )
+
+    pts = [(x_at(i), y_at(v)) for i, v in enumerate(totals)]
+    if partial_today and n >= 2:
+        solid_pts, dotted_pts = pts[:-1], pts[-2:]
+    else:
+        solid_pts, dotted_pts = pts, []
+    lines_svg = [
+        f'<polyline class="series-line" points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in solid_pts)}" '
+        f'fill="none" stroke-width="2" style="stroke:var({var}, {light})" />'
+    ]
+    if dotted_pts:
+        lines_svg.append(
+            f'<polyline class="series-line" points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in dotted_pts)}" '
+            f'fill="none" stroke-width="2" stroke-linecap="round" stroke-dasharray="0.1 6" '
+            f'style="stroke:var({var}, {light})" />'
+        )
+
+    dot_svg = endpoint_label = ""
+    if n:
+        last_x, last_y = pts[-1]
+        if partial_today:
+            dot_svg = (
+                f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4" fill="var(--surface-1)" '
+                f'stroke-width="2" class="series-dot" style="stroke:var({var}, {light})" />'
+            )
+        else:
+            dot_svg = (
+                f'<circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4" '
+                f'class="series-dot" style="fill:var({var}, {light})" />'
+            )
+        endpoint_label = (
+            f'<text class="endpoint-label" x="{last_x + 8:.1f}" y="{last_y + 4:.1f}">{format_bytes(totals[-1])}</text>'
+        )
+
+    chart_data = json.dumps(
+        {
+            "dates": dates,
+            "series": [{"host": "All origins", "shares": totals}],
+            "geometry": {"width": width, "height": height},
+            "xAt": [x_at(i) for i in range(n)],
+            "unit": "bytes",
+        }
+    )
+
+    table_rows = "".join(f"<tr><td>{d}</td><td>{format_bytes(v)}</td></tr>" for d, v in zip(dates, totals))
+    partial_note = (
+        f'<p class="note">* {dates[-1]} is today (UTC) and still accumulating -- '
+        f'the dotted segment will keep changing until the day closes. '
+        f'{TREND_NOTE} (least-squares fit, excluding today).</p>'
+        if partial_today and dates else f'<p class="note">{TREND_NOTE} (least-squares fit).</p>'
+    )
+
+    section_html = f"""
+<h2>Total egress, all origins</h2>
+<p class="subtitle">Response bytes (body + headers) served by all origins per day, {dates[0] if dates else "?"} to {dates[-1] if dates else "?"} -- {format_bytes(sum(totals))} total</p>
+<div class="chart-card" style="position: relative;">
+  <svg viewBox="0 0 {width} {height}">
+    {plot_clip_svg(f"clip-{section_id}", margin_left, margin_top, chart_w, chart_h)}
+    {gridlines}
+    <line x1="{margin_left}" y1="{margin_top + chart_h}" x2="{width - margin_right}" y2="{margin_top + chart_h}" stroke="var(--baseline)" stroke-width="1" />
+    {trend_line_svg(totals, x_at, y_at, partial_today, f"stroke:var({var}, {light})", f"clip-{section_id}")}
+    {"".join(lines_svg)}
+    {dot_svg}
+    {x_labels}
+    {endpoint_label}
+    <rect id="hover-target-{section_id}" x="{margin_left}" y="{margin_top}" width="{chart_w}" height="{chart_h}" fill="transparent" />
+    <line id="crosshair-{section_id}" x1="0" y1="{margin_top}" x2="0" y2="{margin_top + chart_h}" stroke="var(--baseline)" stroke-width="1" style="display:none" />
+  </svg>
+  <div id="tooltip-{section_id}" class="tooltip"></div>
+</div>
+{partial_note}
+<details class="table-view">
+  <summary>View as table</summary>
+  <table>
+    <thead><tr><th>Date</th><th>Total egress</th></tr></thead>
+    <tbody>{table_rows}</tbody>
+  </table>
+</details>
+"""
+
+    js_snippet = f"""
+wireHover({json.dumps(section_id)}, {chart_data});
+"""
+    return section_html, f"  {var}: {light};", f"  {var}: {dark};", js_snippet
+
+
+def render_html(service_id, dates, sections, host_colors, partial_today, out_path, total_section=None):
+    """sections: list of (section_id, title, metric_label, series).
+    total_section: optional (section_html, css_light, css_dark, js) rendered first."""
+    section_htmls = []
+    css_light_all = []
+    css_dark_all = []
+    js_all = []
+    if total_section:
+        section_html, css_light, css_dark, js_snippet = total_section
+        section_htmls.append(section_html)
+        css_light_all.append(css_light)
+        css_dark_all.append(css_dark)
+        js_all.append(js_snippet)
+    for section_id, title, metric_label, series in sections:
+        section_html, css_light, css_dark, js_snippet = render_section(
+            section_id, title, metric_label, dates, series, host_colors, partial_today
+        )
+        section_htmls.append(section_html)
+        css_light_all.append(css_light)
+        css_dark_all.append(css_dark)
+        js_all.append(js_snippet)
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Origin traffic share -- {service_id}</title>
+<style>
+  :root {{
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+{chr(10).join(css_light_all)}
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+{chr(10).join(css_dark_all)}
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 32px;
+    background: var(--page); color: var(--text-primary);
+    font: 14px system-ui, -apple-system, "Segoe UI", sans-serif;
+  }}
+  h1 {{ font-size: 18px; margin: 0 0 4px; }}
+  h2 {{ font-size: 15px; margin: 32px 0 4px; }}
+  h2:first-of-type {{ margin-top: 20px; }}
+  .subtitle {{ color: var(--text-secondary); margin: 0 0 12px; }}
+  .note {{ color: var(--text-muted); font-size: 12px; margin: 8px 0 0; }}
+  .chart-card {{
+    background: var(--surface-1); border-radius: 12px; padding: 16px;
+    max-width: 992px;
+  }}
+  svg {{ width: 100%; height: auto; display: block; overflow: visible; }}
+  .grid {{ stroke: var(--grid); stroke-width: 1; }}
+  .axis-label {{ fill: var(--text-muted); font-size: 11px; }}
+  .endpoint-label {{ fill: var(--text-secondary); font-size: 11px; }}
+  .trend-line {{ opacity: 0.55; }}
+  .series-dot {{ stroke: var(--surface-1); stroke-width: 2; }}
+  .legend {{ display: flex; flex-wrap: wrap; gap: 12px 20px; margin-top: 16px; }}
+  .legend-item {{ display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); }}
+  .swatch {{ width: 10px; height: 10px; border-radius: 2px; display: inline-block; }}
+  .tooltip {{
+    position: absolute; pointer-events: none; display: none;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--grid); border-radius: 6px; padding: 8px 10px;
+    font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); white-space: nowrap;
+  }}
+  .tooltip .row {{ display: flex; align-items: center; gap: 6px; }}
+  .tooltip .date {{ color: var(--text-secondary); margin-bottom: 4px; }}
+  details.table-view {{ margin-top: 16px; color: var(--text-secondary); }}
+  details.table-view summary {{ cursor: pointer; color: var(--text-primary); }}
+  table {{ border-collapse: collapse; margin-top: 10px; font-variant-numeric: tabular-nums; font-size: 12px; }}
+  th, td {{ padding: 4px 10px; text-align: right; border-bottom: 1px solid var(--grid); }}
+  th:first-child, td:first-child {{ text-align: left; }}
+</style>
+</head>
+<body>
+<h1>Origin traffic share -- {service_id}</h1>
+{"".join(section_htmls)}
+<script>
+function formatBytes(v) {{
+  const units = [["PB", 1e15], ["TB", 1e12], ["GB", 1e9], ["MB", 1e6], ["KB", 1e3], ["B", 1]];
+  for (const [unit, size] of units) {{
+    if (Math.abs(v) >= size) return (v / size).toFixed(1) + " " + unit;
+  }}
+  return "0 B";
+}}
+
+function wireHover(sectionId, chartData) {{
+  const card = document.getElementById("hover-target-" + sectionId).closest(".chart-card");
+  const svg = card.querySelector("svg");
+  const hoverTarget = document.getElementById("hover-target-" + sectionId);
+  const crosshair = document.getElementById("crosshair-" + sectionId);
+  const tooltip = document.getElementById("tooltip-" + sectionId);
+  const {{ xAt, dates, series }} = chartData;
+  const fmt = chartData.unit === "bytes" ? formatBytes : (v) => v.toFixed(1) + "%";
+
+  function nearestIndex(mouseX) {{
+    let best = 0, bestDist = Infinity;
+    for (let i = 0; i < xAt.length; i++) {{
+      const dist = Math.abs(xAt[i] - mouseX);
+      if (dist < bestDist) {{ bestDist = dist; best = i; }}
+    }}
+    return best;
+  }}
+
+  hoverTarget.addEventListener("mousemove", (evt) => {{
+    const rect = svg.getBoundingClientRect();
+    const scale = chartData.geometry.width / rect.width;
+    const mouseX = (evt.clientX - rect.left) * scale;
+    const i = nearestIndex(mouseX);
+    if (i == null || !dates.length) return;
+
+    crosshair.style.display = "block";
+    crosshair.setAttribute("x1", xAt[i]);
+    crosshair.setAttribute("x2", xAt[i]);
+
+    const rows = series
+      .map((s) => ({{ host: s.host, value: s.shares[i] }}))
+      .sort((a, b) => b.value - a.value)
+      .map((r) => `<div class="row">${{r.host}}: ${{fmt(r.value)}}</div>`)
+      .join("");
+    tooltip.innerHTML = `<div class="date">${{dates[i]}}</div>${{rows}}`;
+    tooltip.style.display = "block";
+    tooltip.style.left = (evt.clientX - rect.left + 12) + "px";
+    tooltip.style.top = (evt.clientY - rect.top + 12) + "px";
+  }});
+
+  hoverTarget.addEventListener("mouseleave", () => {{
+    crosshair.style.display = "none";
+    tooltip.style.display = "none";
+  }});
+}}
+{"".join(js_all)}
+</script>
+</body>
+</html>
+"""
+
+    with open(out_path, "w") as f:
+        f.write(html)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Chart % share of total traffic by origin for a Fastly service, via Origin Inspector. "
+                     "Generates both a request-count chart and a response-bytes chart, since the two can differ a lot."
+    )
+    parser.add_argument("service_id", help="Fastly service ID")
+    parser.add_argument("--days", type=int, default=30,
+                         help="Number of trailing days to chart, including today (default: 30)")
+    parser.add_argument("--from", dest="date_from", help="Explicit start date, UTC, YYYY-MM-DD (overrides --days)")
+    parser.add_argument("--to", dest="date_to",
+                         help="Explicit end date (exclusive), UTC, YYYY-MM-DD. Default: tomorrow, "
+                              "so today's (partial, still-accumulating) bucket is included")
+    parser.add_argument("--top", type=int, default=8, help="Max distinct origins shown before folding the rest into 'Other' (default: 8)")
+    parser.add_argument("--token", help="Fastly API token (default: $FASTLY_API_TOKEN, else `fastly auth token`)")
+    parser.add_argument("--out", help="Output HTML path (default: ./origin-traffic-share-<service-id>.html)")
+    parser.add_argument("--no-open", action="store_true", help="Don't open the chart in a browser when done")
+    args = parser.parse_args()
+
+    today = datetime.now(timezone.utc).date()
+    # Default end is tomorrow (exclusive), not today, so today's still-open
+    # bucket is included by default -- it's rendered dotted (see partial_today).
+    end_date = datetime.strptime(args.date_to, "%Y-%m-%d").date() if args.date_to else today + timedelta(days=1)
+    if args.date_from:
+        start_date = datetime.strptime(args.date_from, "%Y-%m-%d").date()
+    else:
+        start_date = end_date - timedelta(days=args.days)
+
+    if start_date >= end_date:
+        sys.exit("Error: start date must be before end date.")
+
+    token = get_token(args.token)
+    start_iso = f"{start_date.isoformat()}T00:00:00Z"
+    end_iso = f"{end_date.isoformat()}T00:00:00Z"
+
+    eprint(f"Fetching Origin Inspector stats for service {args.service_id}, {start_date} to {end_date} (day granularity)...")
+    requests_by_host_date, bytes_by_host_date = fetch_origin_metrics(args.service_id, token, start_iso, end_iso)
+
+    if not requests_by_host_date and not bytes_by_host_date:
+        sys.exit(
+            "No Origin Inspector data returned for that window.\n"
+            "This is indistinguishable from Origin Inspector being disabled on this service "
+            "(the API returns 200 with empty data either way). Check with:\n"
+            f"  fastly products -s {args.service_id}"
+        )
+
+    dates = daterange(start_date, end_date)
+    partial_today = bool(dates) and dates[-1] == today.isoformat()
+
+    # Rank by bytes so both charts fold the same origins into "Other" and
+    # keep a consistent color per origin -- bytes is the more meaningful
+    # single ranking metric (it's what Fastly's own UI ranks by too).
+    kept_hosts = rank_hosts_by_volume([bytes_by_host_date, requests_by_host_date], args.top)
+    host_colors = {host: i for i, host in enumerate(kept_hosts)}
+
+    requests_series = build_series(requests_by_host_date, dates, kept_hosts)
+    bytes_series = build_series(bytes_by_host_date, dates, kept_hosts)
+    total_bytes = [sum(by_date.get(d, 0.0) for by_date in bytes_by_host_date.values()) for d in dates]
+
+    out_path = args.out or f"origin-traffic-share-{args.service_id}.html"
+    render_html(
+        args.service_id,
+        dates,
+        [
+            ("bytes", "By response bytes", "response bytes", bytes_series),
+            ("requests", "By request count", "requests", requests_series),
+        ],
+        host_colors,
+        partial_today,
+        out_path,
+        total_section=render_total_section("total", dates, total_bytes, partial_today),
+    )
+
+    eprint(f"Wrote {out_path}")
+    if dates:
+        last = dates[-1]
+        suffix = " (partial, today -- still accumulating)" if partial_today else ""
+        eprint(f"\nTotal egress, all origins: {format_bytes(sum(total_bytes))} over the window, "
+               f"{format_bytes(total_bytes[-1])} on {last}{suffix}")
+        for label, series in (("bytes", bytes_series), ("requests", requests_series)):
+            eprint(f"\nShare on {last}{suffix}, by {label}:")
+            for s in sorted(series, key=lambda s: s["shares"][-1], reverse=True):
+                eprint(f"  {s['host']:<40} {s['shares'][-1]:5.1f}%")
+
+    if not args.no_open and sys.platform == "darwin":
+        subprocess.run(["open", out_path])
+
+
+if __name__ == "__main__":
+    main()
